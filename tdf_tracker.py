@@ -40,17 +40,21 @@ HEADERS = {
 }
 
 
-def get_route():
-    currentstage = requests.get(CURRENT_STAGE_URL).json().get('StageId')
-    route = requests.get(ROUTE_URL.format(currentstage)).json()
+def get_route(stage_id=None):
+    if stage_id is None:
+        stage_id = requests.get(CURRENT_STAGE_URL).json().get('StageId')
+    route = requests.get(ROUTE_URL.format(stage_id)).json()
     return route
 
+
+def parse_point(point):
+    return (point['Latitude'], point['Longitude'])
 
 def parse_route(route):
     """Parse the route as a lat/long numpy array"""
     parsedroute = []
     for point in route:
-        parsed = (point['Latitude'], point['Longitude'])
+        parsed = parse_point(point)
         parsedroute.append(parsed)
     return np.asarray(parsedroute)
 
@@ -121,33 +125,67 @@ def refresh_from_file():
 
 class PositionTracker:
 
-    def __init__(self):
+    def __init__(self, stage_id=None):
         """Create an object that keeps track of a position through time"""
-        self.head_pos = []
-        self.head_time = []
+        route = get_route(stage_id)
+        self.route = parse_route(route)
+        self.head_time = [None] * len(route)
+        self.last_head_ix = None
+        self.haspos = False
 
     def track_head_pos(self, j):
         """Record the position at a given time"""
         # TODO take a group as input instead of the whole object
         head = j['Groups'][0]['Riders'][0]
         ts = j['TimeStampEpochInt']
-        postuple = (head['Latitude'], head['Longitude'])
-        self.head_pos.append(postuple)
-        self.head_time.append(ts)
-        assert len(self.head_pos) == len(self.head_time)
+        postuple = parse_point(head)
+        idx = self.closest_point(postuple)[0]
+        self.head_time[idx] = ts
+        self.last_head_ix = idx
+        self.check_empty_spots()
+        self.haspos = True
 
+    def check_empty_spots(self):
+        """Check whether all intermediate spots in head_time
+        are filled. Pretty ugly but it works for now
+        """
+        last_idx = self.last_head_ix
+        if not self.haspos:
+            return
+        prev_idx = last_idx - 1
+        prev_value = self.head_time[prev_idx]
+        while prev_value is None:
+            prev_idx -= 1
+            prev_value = self.head_time[prev_idx]
+        num_missing = last_idx - prev_idx + 1
+        if num_missing > 0:
+            last_time = self.head_time[last_idx]
+            prev_time = self.head_time[prev_idx]
+            timediff = last_time - prev_time
+            each = timediff / num_missing
+            for i in range(1, num_missing + 1):
+                self.head_time[prev_idx + i] = int(prev_time + i * each)
 
-    def closest_point(self, point):
+    def time_behind_head(self, point, ts):
+        """If known, return moment in time the head group passed this point"""
+        if isinstance(point, dict):
+            point = parse_point(point)
+        idx = self.closest_point(point)[0]
+        head_ts = self.head_time[idx]
+        if head_ts is None:
+            return None
+        return ts - head_ts
+
+    def closest_point(self, point, route=None):
         """Return the timestamp of a position closest to a point"""
-        route = np.asarray(self.head_pos)
+        if route is None:
+            route = np.asarray(self.route)
+        if isinstance(point, dict):
+            point = parse_point(point)
         dist = np.sum((route - point) ** 2, axis=1)
         idx_closest = np.argmin(dist)
         diff = great_circle(route[idx_closest], point).meters
-        if diff < 100:
-            return self.head_time[idx_closest]
-        else:
-            print('not close enough (yet) @ {} meters'.format(diff))
-            return None
+        return idx_closest, self.route[idx_closest], diff
 
 
 class RiderTracker:
@@ -165,7 +203,7 @@ class RiderTracker:
                 self.known_riders[rider['Id']] = group['GroupId']
         current_missing = self.known_riders.keys() - current_riders
         print('missing: {}'.format(current_missing))
-    
+
     def return_valid_riderlist(self):
         pass
         # TODO create a method that returns a list of all riders and
@@ -175,8 +213,7 @@ class RiderTracker:
 def main(real=True):
     max_speed = [0, 0]
     update = refresh(real)
-    head_pos_time = []
-    pt = PositionTracker()
+    pt = PositionTracker(22)
     rt = RiderTracker()
     while True:
         os.system('clear')
@@ -204,11 +241,10 @@ def main(real=True):
                 timegap = secs_to_ms(group['GapToLeadingGroupT'])
                 kw = 'behind ({})'.format(timegap)
                 first = group['Riders'][0]
-                postuple = (first['Latitude'], first['Longitude'])
-                timehead = pt.closest_point(postuple)
-                if timehead is not None:
+                timediff = pt.time_behind_head(first, ts)
+                if timediff is not None:
                     print('timediff w/head: {}'.format(
-                        secs_to_ms(ts - timehead)))
+                        secs_to_ms(timediff)))
                     # this should be roughly equal to 'GapToLeadingGroupT'
                     # given that they are calculated in a similar fashion
             print('{} has {} riders and {:.1f} km {}'.format(
@@ -233,7 +269,7 @@ def main(real=True):
         print(u'max speed: {} km/h by rider {}'.format(max_speed[0],
                                                        max_speed_rider))
         rt.update_riders(j)
-        time.sleep(5)
+        time.sleep(1)
 
 if __name__ == '__main__':
     pass
